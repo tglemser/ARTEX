@@ -106,9 +106,11 @@ RUN set -eux; \
 FROM python:3.12-slim-bookworm
 ARG TARGETARCH
 # Common tools: ripgrep / curl / vim, plus a set of recon staples (add/remove as needed).
+# iproute2 (ip, ss): workers run `ip route get <target>` and `ss` for basic
+# network diagnosis; without it a worker burnt turns on "bash: ip: command not found".
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip xz-utils \
-      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+      dnsutils iputils-ping iproute2 netcat-openbsd inetutils-telnet whois nmap \
     && rm -rf /var/lib/apt/lists/*
 # Node 22 from the official nodejs.org tarball, verified against its SHASUMS256.txt:
 # bookworm's apt nodejs is 18, Playwright requires >=20, and 20 is end-of-life.
