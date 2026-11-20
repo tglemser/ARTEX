@@ -392,3 +392,68 @@ func TestScanIngestItemCap(t *testing.T) {
 			len(s.Assets)+len(s.Facts), s.Events, s.OverCap, s.Truncated, scanMaxItems, scanMaxItems/2)
 	}
 }
+
+// An nmap XML in the shape --host-timeout produces: the first host is cut off
+// (-sT -p1-65535 --host-timeout 240s against a host that drops every SYN):
+// nmap exited 0, the host carries timedout="true" and no <ports> element. It
+// must come back as an incomplete scan, not as a host with no open ports, and
+// a host whose ports are all filtered must be named as such.
+func TestScanIngestNmapTimedOutAndFiltered(t *testing.T) {
+	const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="nmap" args="nmap -sT -Pn -p1-65535 -T4 --max-retries 1 --host-timeout 240s -oX 113_full.xml 203.0.113.13" start="1795105172" version="7.93" xmloutputversion="1.05">
+<scaninfo type="connect" protocol="tcp" numservices="65535" services="1-65535"/>
+<host starttime="1795105172" endtime="1795105412" timedout="true"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="203.0.113.13" addrtype="ipv4"/>
+<hostnames>
+</hostnames>
+</host>
+<host starttime="1795105172" endtime="1795105240"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="203.0.113.12" addrtype="ipv4"/>
+<hostnames></hostnames>
+<ports><extraports state="filtered" count="65535">
+<extrareasons reason="no-responses" count="65535"/>
+</extraports>
+</ports>
+</host>
+<runstats><finished time="1795105412" summary="Nmap done at Thu Nov 19 16:23:32 2026; 2 IP addresses (2 hosts up) scanned in 240.24 seconds" elapsed="240.24" exit="success"/><hosts up="2" down="0" total="2"/>
+</runstats>
+</nmaprun>
+`
+	s := parseScan(t, "nmap-xml", xml)
+	if s.Events != 2 || s.Incomplete != 1 || s.Ports != 0 || len(s.hosts) != 2 || s.Truncated {
+		t.Fatalf("events=%d incomplete=%d ports=%d hosts=%d truncated=%v", s.Events, s.Incomplete, s.Ports, len(s.hosts), s.Truncated)
+	}
+	checkScanFacts(t, s)
+	if len(s.Facts) != 2 {
+		t.Fatalf("facts: %+v", s.Facts)
+	}
+	cut := s.Facts[0]
+	if !strings.Contains(cut.Summary, "203.0.113.13") || !strings.Contains(cut.Summary, "cut off by host-timeout") || strings.Contains(cut.Summary, "open ports") {
+		t.Fatalf("timed-out host summary: %q", cut.Summary)
+	}
+	if d, _ := strconv.Unquote(cut.Detail); !strings.Contains(d, "incomplete") || !strings.Contains(d, "assumed (-Pn)") {
+		t.Fatalf("timed-out host detail: %s", d)
+	}
+	for _, a := range s.Assets {
+		if a.IP == "203.0.113.13" {
+			t.Fatalf("a timed-out host must not become an asset: %+v", a)
+		}
+	}
+	if items := s.Notable["incomplete"]; len(items) != 1 || !strings.Contains(items[0], "203.0.113.13") {
+		t.Fatalf("notable incomplete: %v", s.Notable)
+	}
+	filtered := s.Facts[1]
+	if !strings.Contains(filtered.Summary, "203.0.113.12") || !strings.Contains(filtered.Summary, "65535 filtered") || !strings.Contains(filtered.Summary, "not proven closed") {
+		t.Fatalf("all-filtered host summary: %q", filtered.Summary)
+	}
+	if d, _ := strconv.Unquote(filtered.Detail); !strings.Contains(d, `"extraports":{"filtered":65535}`) {
+		t.Fatalf("all-filtered host detail: %s", d)
+	}
+	// A completed host with open ports is unchanged (TestScanIngestNmap covers the
+	// wording); a host that is down still yields nothing.
+	s = parseScan(t, "nmap-xml", nmapFixture)
+	if s.Incomplete != 0 || len(s.Notable["incomplete"]) != 0 {
+		t.Fatalf("completed scan marked incomplete: %d %v", s.Incomplete, s.Notable)
+	}
+}

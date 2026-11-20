@@ -34,11 +34,14 @@ const scanMaxItems = 50000
 // items, the facts, and a capped list of notable items per type.
 type scanIngest struct {
 	Events, Ports, Skipped, Oversized, OverCap int
-	Truncated                                  bool
-	hosts, urls                                map[string]bool
-	Assets                                     []assetInputItem
-	Facts                                      []factItem
-	Notable                                    map[string][]string
+	// Incomplete counts hosts whose scan nmap cut off (host timedout="true"):
+	// they yield a fact that says so and no port claims.
+	Incomplete  int
+	Truncated   bool
+	hosts, urls map[string]bool
+	Assets      []assetInputItem
+	Facts       []factItem
+	Notable     map[string][]string
 }
 
 func newScanIngest() *scanIngest {
@@ -133,9 +136,18 @@ func scanHostOf(s string) string {
 // ---- nmap -oX ----
 
 type nmapHost struct {
-	Status struct {
+	// TimedOut is "true" when --host-timeout cut the host off: nmap then writes
+	// no <ports> element at all, which must not read as "no open ports".
+	TimedOut string `xml:"timedout,attr"`
+	Status   struct {
 		State string `xml:"state,attr"`
+		// Reason "user-set" means -Pn: the host was assumed up, not observed up.
+		Reason string `xml:"reason,attr"`
 	} `xml:"status"`
+	ExtraPorts []struct {
+		State string `xml:"state,attr"`
+		Count int    `xml:"count,attr"`
+	} `xml:"ports>extraports"`
 	Addrs []struct {
 		Addr string `xml:"addr,attr"`
 		Type string `xml:"addrtype,attr"`
@@ -230,6 +242,18 @@ func (s *scanIngest) addNmapHost(h nmapHost) {
 	}
 	s.hosts[ip] = true
 	detail := map[string]any{"ip": ip, "hostnames": h.Names, "os": h.OS}
+	if h.Status.Reason == "user-set" {
+		detail["host_up"] = "assumed (-Pn), not observed"
+	}
+	if h.TimedOut == "true" {
+		// --host-timeout fired: an incomplete scan, not a result. No ip asset
+		// with "no open ports", no service assets; the fact names the gap.
+		s.Incomplete++
+		detail["scan"] = "incomplete: host timeout before any port result"
+		s.note("incomplete", ip+" host timeout, no port results")
+		s.fact(fmt.Sprintf("nmap: scan of host %s was cut off by host-timeout before any port result; its ports are undetermined (not closed), rescan with a longer timeout or smaller port ranges", ip), detail)
+		return
+	}
 	var bound []string
 	for _, n := range h.Names {
 		// Only the name the operator scanned is bound to the IP; a PTR name is
@@ -276,6 +300,22 @@ func (s *scanIngest) addNmapHost(h nmapHost) {
 	summary := fmt.Sprintf("nmap: host %s has %d open ports: %s", ip, len(list), strings.Join(shown, ", "))
 	if len(list) > len(shown) {
 		summary += fmt.Sprintf(" and %d more", len(list)-len(shown))
+	}
+	// Ports nmap folded into <extraports> (filtered: no answer at all; closed:
+	// RST). All-filtered is a firewall verdict, not an empty host; say so.
+	if len(h.ExtraPorts) > 0 {
+		extra := map[string]int{}
+		filtered := 0
+		for _, e := range h.ExtraPorts {
+			extra[e.State] += e.Count
+			if strings.Contains(e.State, "filtered") {
+				filtered += e.Count
+			}
+		}
+		detail["extraports"] = extra
+		if len(list) == 0 && filtered > 0 {
+			summary = fmt.Sprintf("nmap: host %s answered on none of %d scanned ports (%d filtered, no response: a firewall drops the probes); no open port found, ports not proven closed", ip, filtered+extra["closed"], filtered)
+		}
 	}
 	detail["ports"] = ports
 	s.fact(summary, detail)
