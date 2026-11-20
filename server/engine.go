@@ -598,6 +598,10 @@ type steerHooks struct {
 	// budget meters this intent's run (nil = no budget). Once exhausted, every tool
 	// but the write-back ones is refused with the wrap-up instruction.
 	budget *agent.IntentMeter
+	// factLoop stops this intent after two consecutive identical record_fact
+	// input-contract errors (nil = off). Shared pointer: the harness holds a copy
+	// of steerHooks, and the count must survive the copy.
+	factLoop *recordFactLoopGuard
 }
 
 // Default number of reruns for idle turns (thinking only, neither body text nor tool
@@ -649,6 +653,9 @@ func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (
 }
 
 func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
+	if h.factLoop != nil {
+		h.factLoop.observe(name, result, isErr)
+	}
 	if h.inner != nil {
 		h.inner.PostToolUse(ctx, name, input, result, isErr)
 	}
@@ -1251,6 +1258,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
 		budget: meter,
+		// Per intent run, including the model_error reruns below: a rerun that
+		// repeats the same refused call must not start the count over.
+		factLoop: newRecordFactLoopGuard(label, workCancel),
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
@@ -1336,6 +1346,25 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// write (the fence would reject every write below).
 	if errors.Is(workCause, agent.AbortWorkClaimLost) {
 		log.Printf("[worker %s] task %s intent #%d claim lost to another worker, result discarded", name, t.ID, intent.ID)
+		return true
+	}
+	// Two consecutive identical record_fact input errors cancelled this run
+	// (steerHooks.factLoop): the model kept sending a shape the tool refuses, and
+	// every further turn would resend the same context. Settle as blocked with a
+	// named reason — not stopped (that is the planner's kill), not open (a resume
+	// would replay the loop) — so the planner sees why and does not re-dispatch
+	// the direction unchanged. Checked before the kill branch: this cancel also
+	// leaves the task context alive.
+	if agent.AbortCodeIs(workCause, agent.AbortCodeRecordFactLoop) {
+		if err := t.Store.SettleIntentClaimBlocked(intent.ID, token, db.IntentBlockedRecordFactLoop); err != nil {
+			log.Printf("[worker %s] task %s intent #%d failed to persist the record_fact loop block: %v", name, t.ID, intent.ID, err)
+			if errors.Is(err, db.ErrIntentClaimLost) {
+				return true
+			}
+		}
+		log.Printf("[worker %s] task %s intent #%d blocked (%s): %v (wrote back %s)", name, t.ID, intent.ID, db.IntentBlockedRecordFactLoop, workCause, wrote)
+		e.touch(t.ID)
+		t.NotifyDone(intent.ID)
 		return true
 	}
 	// if a pause cancelled this run mid-flight, return the intent to the frontier

@@ -11,6 +11,11 @@ import (
 
 const IntentBlockedLLMQuota = "llm_quota_exhausted"
 
+// IntentBlockedRecordFactLoop marks an intent the engine stopped after two
+// consecutive identical record_fact input-contract errors (server: recordFactLoopGuard).
+// Unlike IntentBlockedLLMQuota it is never reopened automatically.
+const IntentBlockedRecordFactLoop = "record_fact_input_loop"
+
 // TaskLLMProfile is one ordered entry in a task's explicit failover chain.
 type TaskLLMProfile struct {
 	ProfileID   int64      `json:"profile_id"`

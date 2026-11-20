@@ -49,6 +49,8 @@ var (
 		"The user deleted a running Worker. This call was cancelled; after the Worker exits the write area, the server handles the intent per the user-chosen deletion mode — soft delete only marks it deleted and keeps all outputs, hard delete cascades to remove the intent and the downstream nodes supported only by it")
 	AbortWorkClaimLost = cause("work_claim_lost", "Another Worker took this intent over",
 		"This Worker's claim on the intent expired (no heartbeat reached the database within the claim TTL) and another Worker took the intent over, so its heartbeat was rejected. This run was cancelled and its result is discarded; the intent now belongs to the new claimer")
+	AbortWorkRecordFactLoop = cause(AbortCodeRecordFactLoop, "Repeated record_fact input errors stopped this intent",
+		"record_fact refused the Worker's input twice in a row with the same input-contract error, so the Worker was sending a shape the tool cannot accept and every further turn would have resent the same context (a prior run burnt millions of tokens this way). The engine cancelled the run and settled the intent as blocked with reason record_fact_input_loop; facts, assets and findings written before are kept. Re-dispatching the same direction unchanged repeats the failure: check the worker trace for the refused call")
 	AbortWorkFinished = cause("work_finished", "Worker finished normally, context freed",
 		"The Worker finished normally, and the engine released its context resources in detachWork. This is not an interruption; if it appears in an interruption message, the cancel and finish events raced")
 	AbortPausedRaceGuard = cause("paused_race_guard", "Refused a new run while task is paused",
@@ -68,6 +70,16 @@ var (
 	AbortRunHardTimeout = cause("run_hard_timeout", "The per-run hard timeout backstop fired",
 		"A single run exceeded the soft wall-clock budget plus the extra grace, meaning a model request or a tool did not return for a long time, so normal turn-boundary wrap-up could not run. Focus on the last unreturned tool call before the interruption")
 )
+
+// AbortCodeRecordFactLoop is the code of AbortWorkRecordFactLoop; the engine
+// matches it by code because the cancel carries a Causef copy with the error.
+const AbortCodeRecordFactLoop = "work_record_fact_loop"
+
+// AbortCodeIs reports whether err is (or wraps) an AbortCause with this code.
+func AbortCodeIs(err error, code string) bool {
+	var ac *AbortCause
+	return errors.As(err, &ac) && ac.Code == code
+}
 
 // AbortReason resolves the named cause attached to a cancelled run context.
 func AbortReason(ctx context.Context) (code, short, text string, ok bool) {
